@@ -1,0 +1,6 @@
+fastapi>=0.110
+uvicorn>=0.29
+itsdangerous>=2.1
+python-multipart>=0.0.9
+qrcode[pil]>=7.4
+psycopg2-binary>=2.9
