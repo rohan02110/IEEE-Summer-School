@@ -229,7 +229,8 @@ def is_admin(request: Request):
 
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
-app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, max_age=60 * 60 * 16,
+# max_age=None creates a session cookie that expires immediately when the browser/session is closed
+app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, max_age=None,
                    same_site="lax", https_only=os.getenv("HTTPS_ONLY_COOKIES", "0") == "1")
 
 CSS = """
@@ -287,11 +288,13 @@ def root(request: Request):
 
 @app.get("/login", response_class=HTMLResponse)
 def login_form(next: str = "/scan", err: str = ""):
-    msg = f"<p style='color:#fca5a5'>{e(err)}</p>" if err else ""
-    return page(f"<h2>Volunteer login</h2>{msg}<form method='post' action='/login'>"
+    msg = f"<p style='color:#fca5a5;margin:6px 0 12px'>{e(err)}</p>" if err else ""
+    return page(f"<h2>Volunteer Login</h2>"
+                f"<p style='color:#94a3b8;font-size:0.95rem;margin:0 0 14px'>Please authenticate to access the scanner dashboard.</p>"
+                f"{msg}<form method='post' action='/login'>"
                 f"<input name='name' placeholder='Your name' required autocomplete='name'>"
-                f"<input name='pin' type='password' inputmode='numeric' placeholder='PIN' required>"
-                f"<input type='hidden' name='next' value='{e(next)}'><button>Log in</button></form>")
+                f"<input name='pin' type='password' inputmode='numeric' placeholder='Volunteer PIN' required autocomplete='current-password'>"
+                f"<input type='hidden' name='next' value='{e(next)}'><button type='submit'>Log in</button></form>", title="Volunteer Login")
 
 
 @app.post("/login")
