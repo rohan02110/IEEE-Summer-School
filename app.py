@@ -131,6 +131,12 @@ def is_unique_violation(exc: Exception) -> bool:
     return "23505" in str(code) or "duplicate key" in msg.lower()
 
 
+def is_missing_column_error(exc: Exception) -> bool:
+    msg = str(getattr(exc, "message", "") or exc)
+    code = str(getattr(exc, "code", "") or "")
+    return "PGRST204" in code or "column" in msg.lower() or "schema cache" in msg.lower()
+
+
 # ---------------------------------------------------------------- core logic (sync -- run via threadpool)
 def mark_sync(code: str, volunteer: str, day: int, lecture: int) -> dict:
     ts = now_iso()
@@ -145,17 +151,36 @@ def mark_sync(code: str, volunteer: str, day: int, lecture: int) -> dict:
     if day is None:
         return {"status": "no_event_day", **base}
 
+    row_data = {"placeholder": code, "day": day, "lecture": lecture, "marked_at": ts, "marked_by": volunteer}
     try:
-        sb.table("attendance").insert(
-            {"placeholder": code, "day": day, "lecture": lecture, "marked_at": ts, "marked_by": volunteer}
-        ).execute()
+        sb.table("attendance").insert(row_data).execute()
         status, at = "marked", ts
     except Exception as ex:
-        if not is_unique_violation(ex):
+        if is_missing_column_error(ex):
+            # Fallback if DB schema hasn't had lecture column added yet
+            row_data = {"placeholder": code, "day": day, "marked_at": ts, "marked_by": volunteer}
+            try:
+                sb.table("attendance").insert(row_data).execute()
+                status, at = "marked", ts
+            except Exception as inner_ex:
+                if not is_unique_violation(inner_ex):
+                    raise
+                existing = (sb.table("attendance").select("marked_at")
+                            .eq("placeholder", code).eq("day", day).execute())
+                status, at = "duplicate", (existing.data[0]["marked_at"] if existing.data else ts)
+        elif not is_unique_violation(ex):
             raise
-        existing = (sb.table("attendance").select("marked_at")
-                    .eq("placeholder", code).eq("day", day).eq("lecture", lecture).execute())
-        status, at = "duplicate", (existing.data[0]["marked_at"] if existing.data else ts)
+        else:
+            try:
+                existing = (sb.table("attendance").select("marked_at")
+                            .eq("placeholder", code).eq("day", day).eq("lecture", lecture).execute())
+            except Exception as qex:
+                if is_missing_column_error(qex):
+                    existing = (sb.table("attendance").select("marked_at")
+                                .eq("placeholder", code).eq("day", day).execute())
+                else:
+                    raise
+            status, at = "duplicate", (existing.data[0]["marked_at"] if existing.data else ts)
 
     sb.table("scan_log").insert({"ts": ts, "code": code, "result": status, "volunteer": volunteer}).execute()
     return {"status": status, "at": at, **base}
@@ -163,19 +188,38 @@ def mark_sync(code: str, volunteer: str, day: int, lecture: int) -> dict:
 
 def stats_sync():
     total = len(sb.table("participants").select("placeholder").execute().data)
-    att = sb.table("attendance").select("day,lecture").execute().data
+    try:
+        att = sb.table("attendance").select("day,lecture").execute().data
+    except Exception as ex:
+        if is_missing_column_error(ex):
+            att = sb.table("attendance").select("day").execute().data
+        else:
+            raise
     per_day_lec = Counter((r["day"], r.get("lecture", 1)) for r in att)
     unknown = len(sb.table("scan_log").select("id").eq("result", "unknown").execute().data)
-    # Embedded select pulls the participant's name/roll_no in the same query via the FK.
-    recent = (sb.table("attendance")
-              .select("day,lecture,marked_at,marked_by,placeholder,participants(name,roll_no)")
-              .order("marked_at", desc=True).limit(40).execute().data)
+    try:
+        recent = (sb.table("attendance")
+                  .select("day,lecture,marked_at,marked_by,placeholder,participants(name,roll_no)")
+                  .order("marked_at", desc=True).limit(40).execute().data)
+    except Exception as ex:
+        if is_missing_column_error(ex):
+            recent = (sb.table("attendance")
+                      .select("day,marked_at,marked_by,placeholder,participants(name,roll_no)")
+                      .order("marked_at", desc=True).limit(40).execute().data)
+        else:
+            raise
     return total, per_day_lec, unknown, recent
 
 
 def export_rows_sync(n_days: int):
     participants = sb.table("participants").select("*").order("placeholder").execute().data
-    att = sb.table("attendance").select("placeholder,day,lecture,marked_at").execute().data
+    try:
+        att = sb.table("attendance").select("placeholder,day,lecture,marked_at").execute().data
+    except Exception as ex:
+        if is_missing_column_error(ex):
+            att = sb.table("attendance").select("placeholder,day,marked_at").execute().data
+        else:
+            raise
     marks = defaultdict(dict)
     for r in att:
         marks[r["placeholder"]][(r["day"], r.get("lecture", 1))] = r["marked_at"]
@@ -194,14 +238,28 @@ def manual_mark_sync(code: str, day: int, lecture: int, action: str, volunteer: 
         return None
     p = res.data[0]
     if action == "unmark":
-        sb.table("attendance").delete().eq("placeholder", code).eq("day", day).eq("lecture", lecture).execute()
+        try:
+            sb.table("attendance").delete().eq("placeholder", code).eq("day", day).eq("lecture", lecture).execute()
+        except Exception as ex:
+            if is_missing_column_error(ex):
+                sb.table("attendance").delete().eq("placeholder", code).eq("day", day).execute()
+            else:
+                raise
         return f"Removed Day {day} Lecture {lecture} mark for {display_name(p)}"
     try:
         sb.table("attendance").insert(
             {"placeholder": code, "day": day, "lecture": lecture, "marked_at": now_iso(), "marked_by": volunteer}
         ).execute()
     except Exception as ex:
-        if not is_unique_violation(ex):
+        if is_missing_column_error(ex):
+            try:
+                sb.table("attendance").insert(
+                    {"placeholder": code, "day": day, "marked_at": now_iso(), "marked_by": volunteer}
+                ).execute()
+            except Exception as inner:
+                if not is_unique_violation(inner):
+                    raise
+        elif not is_unique_violation(ex):
             raise  # already marked -- fine, treat as a no-op
     return f"Marked {display_name(p)} present for Day {day} Lecture {lecture}"
 
@@ -373,7 +431,7 @@ async def api_mark(request: Request):
     return await run_in_threadpool(mark_sync, code, vol(request), day, lecture)
 
 
-SCAN_HTML = """
+SCAN_HTML = r"""
 <h2>Volunteer Scanner</h2>
 <div class="selector-bar">
   <div class="selector-group">
@@ -392,25 +450,81 @@ SCAN_HTML = """
 <div class="badge-bar" id="activeBadge">
   Scanning for: <strong id="activeText">__ACTIVE_TEXT__</strong>
 </div>
-<video id="v" playsinline style="width:100%;border-radius:12px;background:#000"></video>
-<canvas id="c" style="display:none"></canvas>
-<div id="box" class="grey" style="border-radius:16px;padding:20px 12px;margin:12px 0">
-  <p class="big" id="icon">📷</p><h1 id="who">Point at a QR code</h1><p id="sub"></p>
+
+<div class="scanner-container" style="position:relative;width:100%;max-width:400px;margin:0 auto;border-radius:12px;overflow:hidden;background:#000">
+  <video id="v" autoplay playsinline muted style="width:100%;display:block;border-radius:12px"></video>
+  <div class="scanner-overlay" style="position:absolute;top:0;left:0;right:0;bottom:0;pointer-events:none;display:flex;align-items:center;justify-content:center">
+    <div style="width:200px;height:200px;border:3px solid rgba(59,130,246,0.8);border-radius:16px;box-shadow:0 0 0 4000px rgba(0,0,0,0.35);position:relative">
+      <div style="position:absolute;top:0;left:0;right:0;height:2px;background:#60a5fa;animation:scanline 2s infinite ease-in-out"></div>
+    </div>
+  </div>
 </div>
-<p><a href="/logout">Log out</a> · Volunteer: __VOLUNTEER__</p>
+<canvas id="c" style="display:none"></canvas>
+
+<div id="box" class="grey" style="border-radius:16px;padding:20px 12px;margin:12px 0;transition:all 0.2s ease">
+  <p class="big" id="icon" style="margin:0">📷</p>
+  <h1 id="who" style="margin:6px 0;font-size:1.6rem">Point at a QR code</h1>
+  <p id="sub" style="margin:0;font-size:1rem;opacity:0.9">Align the QR code within the square frame</p>
+  <div id="resultLinks" style="margin-top:10px;display:none"></div>
+</div>
+
+<form onsubmit="handleManual(event)" style="display:flex;gap:8px;margin:12px 0">
+  <input id="manualCode" placeholder="Or type code (e.g. P014)" style="flex:1;text-transform:uppercase;margin:0;padding:10px 12px;font-size:1rem" autocomplete="off" autocapitalize="characters">
+  <button type="submit" style="width:auto;padding:10px 18px;margin:0;font-size:1rem">Mark</button>
+</form>
+
+<p style="margin-top:16px"><a href="/logout">Log out</a> · Volunteer: __VOLUNTEER__</p>
+
+<style>
+@keyframes scanline {
+  0% { top: 0%; opacity: 0.8; }
+  50% { top: 96%; opacity: 1; }
+  100% { top: 0%; opacity: 0.8; }
+}
+</style>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jsqr/1.4.0/jsQR.js"></script>
 <script>
-const video=document.getElementById('v'),canvas=document.getElementById('c'),ctx=canvas.getContext('2d');
+const video=document.getElementById('v'),canvas=document.getElementById('c'),ctx=canvas.getContext('2d',{willReadFrequently:true});
 const box=document.getElementById('box'),who=document.getElementById('who'),sub=document.getElementById('sub'),icon=document.getElementById('icon');
+const resultLinks=document.getElementById('resultLinks');
 const daySelect=document.getElementById('daySelect'),lecSelect=document.getElementById('lecSelect'),activeText=document.getElementById('activeText');
-let last='',lastAt=0;
-function show(cls,i,w,s){box.className=cls;icon.textContent=i;who.textContent=w;sub.textContent=s;
-  if(navigator.vibrate)navigator.vibrate(cls==='ok'?80:[80,60,80]);}
+let last='',lastAt=0,scanning=true,detector=null;
+
+if('BarcodeDetector' in window){
+  try{ detector=new BarcodeDetector({formats:['qr_code']}); }catch(e){ detector=null; }
+}
+
+function playBeep(type){
+  try{
+    const ctx=new (window.AudioContext||window.webkitAudioContext)();
+    const osc=ctx.createOscillator();
+    const gain=ctx.createGain();
+    osc.connect(gain); gain.connect(ctx.destination);
+    osc.frequency.value=type==='ok'?880:(type==='warn'?440:220);
+    gain.gain.setValueAtTime(0.1,ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.01,ctx.currentTime+0.15);
+    osc.start(); osc.stop(ctx.currentTime+0.15);
+  }catch(e){}
+}
+
+function show(cls,i,w,s,code){
+  box.className=cls; icon.textContent=i; who.textContent=w; sub.textContent=s;
+  if(code){
+    resultLinks.style.display='block';
+    resultLinks.innerHTML='<a href="/t/'+code+'" style="display:inline-block;padding:8px 14px;background:rgba(255,255,255,0.2);border-radius:8px;color:#fff;text-decoration:none;font-size:0.9rem;font-weight:bold;margin-top:6px">View Confirmation Page →</a>';
+  } else {
+    resultLinks.style.display='none';
+  }
+  playBeep(cls);
+  if(navigator.vibrate) navigator.vibrate(cls==='ok'?80:[80,60,80]);
+}
+
 function updateBadge(){
   const dText=daySelect.selectedOptions[0]?daySelect.selectedOptions[0].text:('Day '+daySelect.value);
   const lText=lecSelect.selectedOptions[0]?lecSelect.selectedOptions[0].text:('Lecture '+lecSelect.value);
   activeText.textContent=dText+' · '+lText;
 }
+
 async function updateActiveSession(){
   updateBadge();
   const day=parseInt(daySelect.value,10)||1;
@@ -421,10 +535,30 @@ async function updateActiveSession(){
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({day,lecture})
     });
-  }catch(e){console.error('Failed to sync session',e);}
+  }catch(e){console.error('Session sync failed',e);}
 }
-async function handle(code){
-  const t=Date.now(); if(code===last&&t-lastAt<3000)return; last=code;lastAt=t;
+
+function extractCode(str){
+  if(!str) return null;
+  str=str.trim();
+  let m=str.match(/\/t\/([A-Za-z0-9]{4,10})/i);
+  if(m) return m[1].toUpperCase();
+  m=str.match(/\\b(P\\d{1,4})\\b/i);
+  if(m){
+    let num=m[1].slice(1);
+    return 'P'+num.padStart(3,'0').toUpperCase();
+  }
+  m=str.match(/(P\\d{3})/i);
+  if(m) return m[1].toUpperCase();
+  return null;
+}
+
+async function handle(rawCode){
+  const code=extractCode(rawCode);
+  if(!code) return;
+  const t=Date.now();
+  if(code===last&&t-lastAt<2500) return;
+  last=code; lastAt=t;
   const day=parseInt(daySelect.value,10)||1;
   const lecture=parseInt(lecSelect.value,10)||1;
   try{
@@ -435,25 +569,83 @@ async function handle(code){
     });
     if(r.status===401){location='/login?next=/scan';return;}
     const d=await r.json();
-    if(d.status==='marked')show('ok','✓',d.name,(d.roll_no?d.roll_no+' · ':'')+'marked Day '+d.day+', Lec '+d.lecture);
-    else if(d.status==='duplicate')show('warn','!',d.name,'Already marked Day '+d.day+', Lec '+d.lecture+' at '+(d.at?d.at.slice(11,19):''));
-    else if(d.status==='no_event_day')show('grey','–','Not an event day','NOT marked');
-    else show('bad','✗','Unknown code','Not registered');
-  }catch(err){show('bad','✗','Network error','Try again');}
-}
-function tick(){
-  if(video.readyState===video.HAVE_ENOUGH_DATA){
-    canvas.width=video.videoWidth;canvas.height=video.videoHeight;
-    ctx.drawImage(video,0,0,canvas.width,canvas.height);
-    const img=ctx.getImageData(0,0,canvas.width,canvas.height);
-    const code=jsQR(img.data,img.width,img.height);
-    if(code){const m=code.data.match(/\\/t\\/([A-Za-z0-9]{4,10})/i); if(m)handle(m[1].toUpperCase());}
+    if(d.status==='marked'){
+      show('ok','✓',d.name,(d.roll_no?d.roll_no+' · ':'')+'Marked Day '+d.day+', Lec '+d.lecture,code);
+    } else if(d.status==='duplicate'){
+      show('warn','!',d.name,'Already marked Day '+d.day+', Lec '+d.lecture+' at '+(d.at?d.at.slice(11,19):''),code);
+    } else if(d.status==='no_event_day'){
+      show('grey','–','Not an event day','NOT marked',code);
+    } else {
+      show('bad','✗','Unknown code ('+code+')','Not registered in participant list',null);
+    }
+  }catch(err){
+    show('bad','✗','Network error','Please try scanning again',null);
   }
-  requestAnimationFrame(tick);
 }
-navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}}).then(s=>{
-  video.srcObject=s;video.play();requestAnimationFrame(tick);
-}).catch(err=>{sub.textContent='Camera error: '+err+' — use your phone camera app to scan instead.';});
+
+function handleManual(e){
+  e.preventDefault();
+  const input=document.getElementById('manualCode');
+  const code=extractCode(input.value);
+  if(code){
+    handle(code);
+    input.value='';
+  } else {
+    show('bad','✗','Invalid format','Enter e.g. P001',null);
+  }
+}
+
+let lastScanTime=0;
+async function scanFrame(){
+  if(!scanning) return;
+  const now=Date.now();
+  if(now-lastScanTime>120 && video.readyState>=HTMLMediaElement.HAVE_CURRENT_DATA && video.videoWidth>0){
+    lastScanTime=now;
+    if(detector){
+      try{
+        const barcodes=await detector.detect(video);
+        if(barcodes&&barcodes.length>0&&barcodes[0].rawValue){
+          handle(barcodes[0].rawValue);
+        }
+      }catch(e){}
+    } else if(typeof jsQR!=='undefined'){
+      try{
+        const scale=Math.min(1, 640/Math.max(video.videoWidth, video.videoHeight));
+        canvas.width=Math.floor(video.videoWidth*scale);
+        canvas.height=Math.floor(video.videoHeight*scale);
+        ctx.drawImage(video,0,0,canvas.width,canvas.height);
+        const imgData=ctx.getImageData(0,0,canvas.width,canvas.height);
+        const qr=jsQR(imgData.data,canvas.width,canvas.height,{inversionAttempts:'dontInvert'});
+        if(qr&&qr.data){
+          handle(qr.data);
+        }
+      }catch(e){}
+    }
+  }
+  requestAnimationFrame(scanFrame);
+}
+
+const constraints={
+  audio: false,
+  video: {
+    facingMode: {ideal:'environment'},
+    width: {ideal:1280},
+    height: {ideal:720}
+  }
+};
+
+navigator.mediaDevices.getUserMedia(constraints)
+  .catch(()=>navigator.mediaDevices.getUserMedia({video:true}))
+  .then(s=>{
+    video.srcObject=s;
+    video.setAttribute('playsinline','true');
+    video.setAttribute('muted','true');
+    video.play().then(()=>{ requestAnimationFrame(scanFrame); }).catch(()=>{ requestAnimationFrame(scanFrame); });
+  })
+  .catch(err=>{
+    sub.textContent='Camera access denied or unavailable. Use manual input above or phone camera app.';
+    box.className='bad'; icon.textContent='⚠️'; who.textContent='Camera unavailable';
+  });
 </script>
 """
 
