@@ -1,7 +1,11 @@
-"""QR-code event attendance, backed by Supabase (Postgres).
+"""QR-code event attendance, backed by Supabase (Postgres) instead of SQLite.
 
-Run schema.sql in the Supabase SQL editor once before starting this.
-Set SUPABASE_DB_URL to your connection string (see .env.example).
+Run schema.sql in your Supabase project's SQL editor FIRST, then:
+  pip install -r requirements.txt
+  cp .env.example .env   # fill in SUPABASE_URL, SUPABASE_KEY (service_role), etc.
+  set -a; source .env; set +a
+  python load_participants.py     # once participants.csv has data
+  uvicorn app:app --host 0.0.0.0 --port 8000
 
 Run:  uvicorn app:app --host 0.0.0.0 --port 8000
 """
@@ -11,20 +15,20 @@ import io
 import os
 import re
 import time
-from collections import defaultdict
-from contextlib import contextmanager
+from collections import Counter, defaultdict
 from datetime import datetime
 from hmac import compare_digest
 from zoneinfo import ZoneInfo
 
-import psycopg2
-import psycopg2.extras
 from fastapi import FastAPI, Form, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from starlette.middleware.sessions import SessionMiddleware
+from supabase import Client, create_client
 
 # ---------------------------------------------------------------- config
-SUPABASE_DB_URL = os.environ["SUPABASE_DB_URL"]  # fail loudly if not set
+SUPABASE_URL = os.environ["SUPABASE_URL"]
+SUPABASE_KEY = os.environ["SUPABASE_KEY"]  # service_role key -- server-side only, never expose to a browser
 SECRET_KEY = os.getenv("SECRET_KEY", "dev-only-change-me")
 VOLUNTEER_PIN = os.getenv("VOLUNTEER_PIN", "1234")
 ADMIN_PIN = os.getenv("ADMIN_PIN", "999999")
@@ -33,18 +37,11 @@ DAY_OVERRIDE = os.getenv("DAY_OVERRIDE")  # testing only
 TZ = ZoneInfo(os.getenv("TZ_NAME", "Asia/Kolkata"))
 CODE_RE = re.compile(r"^P\d{3}$")
 
+sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-@contextmanager
-def conn():
-    con = psycopg2.connect(SUPABASE_DB_URL, cursor_factory=psycopg2.extras.RealDictCursor)
-    try:
-        yield con
-        con.commit()
-    except Exception:
-        con.rollback()
-        raise
-    finally:
-        con.close()
+
+def now_iso() -> str:
+    return datetime.now(TZ).isoformat()
 
 
 def today_day():
@@ -54,40 +51,92 @@ def today_day():
     return EVENT_DATES.index(today) + 1 if today in EVENT_DATES else None
 
 
-def now_str():
-    return datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
+def display_name(p: dict) -> str:
+    return p.get("name") or p["placeholder"]
 
 
-def display_name(row) -> str:
-    return row["name"] or row["placeholder"]
+def is_unique_violation(exc: Exception) -> bool:
+    """Supabase/Postgrest raises on the (placeholder, day) primary key conflict.
+    Match on the Postgres unique-violation code (23505) or the message text,
+    since exact exception shape varies across supabase-py versions."""
+    msg = str(getattr(exc, "message", "") or exc)
+    code = getattr(exc, "code", "") or ""
+    return "23505" in str(code) or "duplicate key" in msg.lower()
 
 
-# ---------------------------------------------------------------- core logic
-def mark(code: str, volunteer: str) -> dict:
+# ---------------------------------------------------------------- core logic (sync -- run via threadpool)
+def mark_sync(code: str, volunteer: str) -> dict:
     day = today_day()
-    ts = now_str()
-    with conn() as c, c.cursor() as cur:
-        cur.execute("SELECT * FROM participants WHERE placeholder=%s", (code,))
-        p = cur.fetchone()
-        if not p:
-            cur.execute("INSERT INTO scan_log(ts,code,result,volunteer) VALUES(%s,%s,%s,%s)",
-                       (ts, code, "unknown", volunteer))
-            return {"status": "unknown"}
-        base = {"name": display_name(p), "roll_no": p["roll_no"] or "", "day": day}
-        if day is None:
-            return {"status": "no_event_day", **base}
-        cur.execute("""INSERT INTO attendance(placeholder,day,marked_at,marked_by) VALUES(%s,%s,%s,%s)
-                       ON CONFLICT (placeholder, day) DO NOTHING RETURNING marked_at""",
-                    (code, day, ts, volunteer))
-        row = cur.fetchone()
-        if row:
-            status, at = "marked", ts
-        else:
-            cur.execute("SELECT marked_at FROM attendance WHERE placeholder=%s AND day=%s", (code, day))
-            status, at = "duplicate", str(cur.fetchone()["marked_at"])
-        cur.execute("INSERT INTO scan_log(ts,code,result,volunteer) VALUES(%s,%s,%s,%s)",
-                   (ts, code, status, volunteer))
-        return {"status": status, "at": at, **base}
+    ts = now_iso()
+
+    res = sb.table("participants").select("*").eq("placeholder", code).execute()
+    if not res.data:
+        sb.table("scan_log").insert({"ts": ts, "code": code, "result": "unknown", "volunteer": volunteer}).execute()
+        return {"status": "unknown"}
+
+    p = res.data[0]
+    base = {"name": display_name(p), "roll_no": p.get("roll_no") or "", "day": day}
+    if day is None:
+        return {"status": "no_event_day", **base}
+
+    try:
+        sb.table("attendance").insert(
+            {"placeholder": code, "day": day, "marked_at": ts, "marked_by": volunteer}
+        ).execute()
+        status, at = "marked", ts
+    except Exception as ex:
+        if not is_unique_violation(ex):
+            raise
+        existing = (sb.table("attendance").select("marked_at")
+                    .eq("placeholder", code).eq("day", day).execute())
+        status, at = "duplicate", existing.data[0]["marked_at"]
+
+    sb.table("scan_log").insert({"ts": ts, "code": code, "result": status, "volunteer": volunteer}).execute()
+    return {"status": status, "at": at, **base}
+
+
+def stats_sync():
+    total = len(sb.table("participants").select("placeholder").execute().data)
+    att = sb.table("attendance").select("day").execute().data
+    per_day = Counter(r["day"] for r in att)
+    unknown = len(sb.table("scan_log").select("id").eq("result", "unknown").execute().data)
+    # Embedded select pulls the participant's name/roll_no in the same query via the FK.
+    recent = (sb.table("attendance")
+              .select("day,marked_at,marked_by,placeholder,participants(name,roll_no)")
+              .order("marked_at", desc=True).limit(40).execute().data)
+    return total, per_day, unknown, recent
+
+
+def export_rows_sync(n_days: int):
+    participants = sb.table("participants").select("*").order("placeholder").execute().data
+    att = sb.table("attendance").select("placeholder,day,marked_at").execute().data
+    marks = defaultdict(dict)
+    for r in att:
+        marks[r["placeholder"]][r["day"]] = r["marked_at"]
+    rows = []
+    for p in participants:
+        m = marks[p["placeholder"]]
+        rows.append([p["placeholder"], p.get("roll_no") or "", p.get("name") or ""] +
+                    [m.get(d, "") for d in range(1, n_days + 1)] + [len(m)])
+    return rows
+
+
+def manual_mark_sync(code: str, day: int, action: str, volunteer: str):
+    res = sb.table("participants").select("placeholder,name").eq("placeholder", code).execute()
+    if not res.data:
+        return None
+    p = res.data[0]
+    if action == "unmark":
+        sb.table("attendance").delete().eq("placeholder", code).eq("day", day).execute()
+        return f"Removed Day {day} mark for {display_name(p)}"
+    try:
+        sb.table("attendance").insert(
+            {"placeholder": code, "day": day, "marked_at": now_iso(), "marked_by": volunteer}
+        ).execute()
+    except Exception as ex:
+        if not is_unique_violation(ex):
+            raise  # already marked -- fine, treat as a no-op
+    return f"Marked {display_name(p)} present for Day {day}"
 
 
 # ---------------------------------------------------------------- auth
@@ -144,11 +193,11 @@ def result_page(r: dict) -> HTMLResponse:
     s = r["status"]
     if s == "marked":
         return page(f"<p class='big'>✓</p><h1>{e(r['name'])}</h1><p>{e(r['roll_no'])}</p>"
-                    f"<h2>Marked present — Day {r['day']}</h2><p>{e(r['at'][11:])}</p>"
+                    f"<h2>Marked present — Day {r['day']}</h2><p>{e(r['at'][11:19])}</p>"
                     f"<p><a href='/scan'>Scan mode</a></p>", "ok")
     if s == "duplicate":
         return page(f"<p class='big'>!</p><h1>{e(r['name'])}</h1><p>{e(r['roll_no'])}</p>"
-                    f"<h2>Already marked today</h2><p>at {e(r['at'][11:])}</p>", "warn")
+                    f"<h2>Already marked today</h2><p>at {e(r['at'][11:19])}</p>", "warn")
     if s == "no_event_day":
         return page(f"<p class='big'>–</p><h1>Not an event day</h1><p>{e(r['name'])} was NOT marked.</p>", "grey")
     return page("<p class='big'>✗</p><h1>Unknown code</h1><p>This QR code is not registered.</p>", "bad")
@@ -193,13 +242,14 @@ def logout(request: Request):
 
 # ---------------------------------------------------------------- routes: scanning
 @app.get("/t/{code}")
-def tap(code: str, request: Request):
+async def tap(code: str, request: Request):
     code = code.upper()
     if not vol(request):
         return RedirectResponse(f"/login?next=/t/{code}", 303)
     if not CODE_RE.match(code):
         return result_page({"status": "unknown"})
-    return result_page(mark(code, vol(request)))
+    r = await run_in_threadpool(mark_sync, code, vol(request))
+    return result_page(r)
 
 
 @app.post("/api/mark")
@@ -210,7 +260,7 @@ async def api_mark(request: Request):
     code = str(data.get("code", "")).upper()
     if not CODE_RE.match(code):
         return {"status": "unknown"}
-    return mark(code, vol(request))
+    return await run_in_threadpool(mark_sync, code, vol(request))
 
 
 SCAN_HTML = """
@@ -235,7 +285,7 @@ async function handle(code){
     if(r.status===401){location='/login?next=/scan';return;}
     const d=await r.json();
     if(d.status==='marked')show('ok','✓',d.name,d.roll_no+' · marked Day '+d.day);
-    else if(d.status==='duplicate')show('warn','!',d.name,'Already marked at '+d.at.slice(11));
+    else if(d.status==='duplicate')show('warn','!',d.name,'Already marked at '+d.at.slice(11,19));
     else if(d.status==='no_event_day')show('grey','–','Not an event day','NOT marked');
     else show('bad','✗','Unknown code','Not registered');
   }catch(err){show('bad','✗','Network error','Try again');}
@@ -267,25 +317,17 @@ def scan(request: Request):
 
 # ---------------------------------------------------------------- routes: admin
 @app.get("/admin", response_class=HTMLResponse)
-def admin(request: Request, msg: str = ""):
+async def admin(request: Request, msg: str = ""):
     if not is_admin(request):
         return RedirectResponse("/login?next=/admin", 303)
     n_days = len(EVENT_DATES) or 5
-    with conn() as c, c.cursor() as cur:
-        cur.execute("SELECT COUNT(*) AS n FROM participants")
-        total = cur.fetchone()["n"]
-        cur.execute("SELECT day, COUNT(*) AS n FROM attendance GROUP BY day")
-        per_day = {r["day"]: r["n"] for r in cur.fetchall()}
-        cur.execute("""SELECT p.name, p.roll_no, p.placeholder, a.day, a.marked_at, a.marked_by
-                       FROM attendance a JOIN participants p ON p.placeholder=a.placeholder
-                       ORDER BY a.marked_at DESC LIMIT 40""")
-        recent = cur.fetchall()
-        cur.execute("SELECT COUNT(*) AS n FROM scan_log WHERE result='unknown'")
-        unknown = cur.fetchone()["n"]
+    total, per_day, unknown, recent = await run_in_threadpool(stats_sync)
     stats = "".join(f"<tr><td>Day {d}</td><td>{per_day.get(d, 0)} / {total}</td></tr>" for d in range(1, n_days + 1))
-    rows = "".join(f"<tr><td>{e(r['name'] or r['placeholder'])}</td><td>{e(r['roll_no'] or '')}</td>"
-                   f"<td>{e(r['placeholder'])}</td><td>D{r['day']}</td>"
-                   f"<td>{e(str(r['marked_at'])[11:19])}</td><td>{e(r['marked_by'])}</td></tr>" for r in recent)
+    rows = "".join(
+        f"<tr><td>{e((r.get('participants') or {}).get('name') or r['placeholder'])}</td>"
+        f"<td>{e((r.get('participants') or {}).get('roll_no') or '')}</td>"
+        f"<td>{e(r['placeholder'])}</td><td>D{r['day']}</td>"
+        f"<td>{e(r['marked_at'][11:19])}</td><td>{e(r['marked_by'])}</td></tr>" for r in recent)
     opts = "".join(f"<option value='{d}'>Day {d}</option>" for d in range(1, n_days + 1))
     note = f"<p style='color:#86efac'>{e(msg)}</p>" if msg else ""
     body = (f"<h2>Admin</h2>{note}<p>Today = Day {today_day() or '—'} · registered: {total} · unknown scans: {unknown}</p>"
@@ -299,50 +341,30 @@ def admin(request: Request, msg: str = ""):
 
 
 @app.post("/admin/manual")
-def admin_manual(request: Request, placeholder: str = Form(...), day: int = Form(...), action: str = Form(...)):
+async def admin_manual(request: Request, placeholder: str = Form(...), day: int = Form(...), action: str = Form(...)):
     if not is_admin(request):
         return RedirectResponse("/login?next=/admin", 303)
     code = placeholder.strip().upper()
-    with conn() as c, c.cursor() as cur:
-        cur.execute("SELECT placeholder, name FROM participants WHERE placeholder=%s", (code,))
-        p = cur.fetchone()
-        if not p:
-            return RedirectResponse("/admin?msg=Placeholder+not+found", 303)
-        if action == "unmark":
-            cur.execute("DELETE FROM attendance WHERE placeholder=%s AND day=%s", (code, day))
-            msg = f"Removed Day {day} mark for {display_name(p)}"
-        else:
-            cur.execute("""INSERT INTO attendance(placeholder,day,marked_at,marked_by) VALUES(%s,%s,%s,%s)
-                           ON CONFLICT (placeholder, day) DO NOTHING""",
-                       (code, day, now_str(), vol(request)))
-            msg = f"Marked {display_name(p)} present for Day {day}"
+    msg = await run_in_threadpool(manual_mark_sync, code, day, action, vol(request))
+    if msg is None:
+        return RedirectResponse("/admin?msg=Placeholder+not+found", 303)
     return RedirectResponse("/admin?msg=" + msg.replace(" ", "+"), 303)
 
 
 @app.get("/export.csv")
-def export_csv(request: Request):
+async def export_csv(request: Request):
     if not is_admin(request):
         return RedirectResponse("/login?next=/export.csv", 303)
     n_days = len(EVENT_DATES) or 5
+    rows = await run_in_threadpool(export_rows_sync, n_days)
     out = io.StringIO()
     w = csv.writer(out)
     w.writerow(["placeholder", "roll_no", "name"] + [f"day{d}" for d in range(1, n_days + 1)] + ["days_attended"])
-    with conn() as c, c.cursor() as cur:
-        cur.execute("SELECT placeholder, day, marked_at FROM attendance")
-        marks = defaultdict(dict)
-        for r in cur.fetchall():
-            marks[r["placeholder"]][r["day"]] = str(r["marked_at"])
-        cur.execute("SELECT * FROM participants ORDER BY placeholder")
-        for p in cur.fetchall():
-            m = marks[p["placeholder"]]
-            w.writerow([p["placeholder"], p["roll_no"] or "", p["name"] or ""] +
-                       [m.get(d, "") for d in range(1, n_days + 1)] + [len(m)])
+    w.writerows(rows)
     return Response(out.getvalue(), media_type="text/csv",
                     headers={"Content-Disposition": "attachment; filename=attendance.csv"})
 
 
 @app.get("/healthz")
 def healthz():
-    with conn() as c, c.cursor() as cur:
-        cur.execute("SELECT 1")
     return {"ok": True}

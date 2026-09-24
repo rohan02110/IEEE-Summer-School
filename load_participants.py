@@ -1,22 +1,23 @@
-"""Load participants.csv (placeholder, roll_no, name) into Supabase.
-Upserts by placeholder -- safe to re-run any time you update names.
+"""Upsert participants.csv (placeholder, roll_no, name) into Supabase.
+Safe to re-run any time you update names -- it upserts by placeholder,
+the primary key, so existing attendance rows are untouched.
 
   python load_participants.py
 """
 import csv
 import os
-import psycopg2
+from supabase import create_client
 
-with psycopg2.connect(os.environ["SUPABASE_DB_URL"]) as con, con.cursor() as cur, \
-     open("participants.csv", newline="", encoding="utf-8-sig") as f:
-    n = 0
+sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+
+rows = []
+with open("participants.csv", newline="", encoding="utf-8-sig") as f:
     for row in csv.DictReader(f):
         code = row["placeholder"].strip().upper()
-        if not code:
-            continue
-        cur.execute("""INSERT INTO participants(placeholder, roll_no, name) VALUES(%s,%s,%s)
-                       ON CONFLICT (placeholder) DO UPDATE SET roll_no=EXCLUDED.roll_no, name=EXCLUDED.name""",
-                   (code, row.get("roll_no", "").strip(), row.get("name", "").strip()))
-        n += 1
-    con.commit()
-print(f"loaded/updated {n} participants")
+        if code:
+            rows.append({"placeholder": code, "roll_no": row.get("roll_no", "").strip(),
+                        "name": row.get("name", "").strip()})
+
+if rows:
+    sb.table("participants").upsert(rows, on_conflict="placeholder").execute()
+print(f"upserted {len(rows)} participants")
