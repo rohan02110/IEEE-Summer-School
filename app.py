@@ -530,7 +530,7 @@ function updateBadge(){
 
 async function updateActiveSession(){
   updateBadge();
-  const day=parseInt(daySelect.value,10)||1;
+  const day=isNaN(parseInt(daySelect.value,10))?0:parseInt(daySelect.value,10);
   const lecture=parseInt(lecSelect.value,10)||1;
   try{
     await fetch('/api/set-active',{
@@ -567,9 +567,9 @@ async function handle(rawCode){
   const t=Date.now();
   if(code===last&&t-lastAt<2500) return;
   last=code; lastAt=t;
-  const day=parseInt(daySelect.value,10)||1;
+  const day=isNaN(parseInt(daySelect.value,10))?0:parseInt(daySelect.value,10);
   const lecture=parseInt(lecSelect.value,10)||1;
-  show('grey','⏳','Processing...','Marking attendance for '+code,null);
+  show('grey','⏳','Processing...','Marking attendance for '+code);
   try{
     const r=await fetch('/api/mark',{
       method:'POST',
@@ -601,7 +601,7 @@ function handleManual(e){
     handle(code);
     input.value='';
   } else {
-    show('bad','✗','Invalid format','Enter e.g. P001',null);
+    show('bad','✗','Invalid format','Enter e.g. P001');
   }
 }
 
