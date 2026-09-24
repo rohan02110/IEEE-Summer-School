@@ -235,12 +235,21 @@ def root(request: Request):
 
 
 @app.get("/login", response_class=HTMLResponse)
-def login_form(next: str = "/scan", err: str = ""):
+def login_form(request: Request, next: str = "/scan", err: str = ""):
+    current_vol = vol(request)
+    current_info = ""
+    if current_vol:
+        role = "Admin" if is_admin(request) else "Volunteer"
+        current_info = (f"<div style='background:#1e293b;border:1px solid #334155;border-radius:10px;padding:12px;margin:12px 0;font-size:0.95rem'>"
+                        f"Currently logged in as <b>{e(current_vol)}</b> ({role})<br style='margin-bottom:6px'>"
+                        f"<a href='/scan'>Go to Scanner</a> · <a href='/admin'>Admin</a> · <a href='/logout' style='color:#f87171'>Log out</a></div>")
     msg = f"<p style='color:#fca5a5'>{e(err)}</p>" if err else ""
-    return page(f"<h2>Volunteer login</h2>{msg}<form method='post' action='/login'>"
+    return page(f"<h2>Volunteer Login</h2>{current_info}{msg}<form method='post' action='/login'>"
                 f"<input name='name' placeholder='Your name' required autocomplete='name'>"
                 f"<input name='pin' type='password' inputmode='numeric' placeholder='PIN' required>"
-                f"<input type='hidden' name='next' value='{e(next)}'><button>Log in</button></form>")
+                f"<input type='hidden' name='next' value='{e(next)}'><button>Log in</button></form>"
+                f"<p style='margin-top:16px;font-size:0.95rem'><a href='/scan'>Scanner</a> · <a href='/admin'>Admin</a></p>",
+                title="Volunteer Login")
 
 
 @app.post("/login")
@@ -311,7 +320,10 @@ SCAN_HTML = """
 <div id="box" class="grey" style="border-radius:16px;padding:20px 12px;margin:12px 0">
   <p class="big" id="icon">📷</p><h1 id="who">Point at a QR code</h1><p id="sub">Active: Lecture <span id="cur-lec">1</span></p>
 </div>
-<p><a href="/logout">Log out</a> · Day: __DAY__ · Lecture: <span id="lbl-lec">1</span></p>
+<p style="font-size:0.95rem;line-height:1.6">
+  Volunteer: <b>__VOL_NAME__</b> (<a href="/login">Switch</a> · <a href="/logout">Log out</a>)<br>
+  Day: <b>__DAY__</b> · Active Lecture: <span id="lbl-lec">1</span> · <a href="/admin">Admin</a>
+</p>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jsqr/1.4.0/jsQR.js"></script>
 <script>
 const video=document.getElementById('v'),canvas=document.getElementById('c'),ctx=canvas.getContext('2d');
@@ -381,10 +393,14 @@ navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}}).then(s=>
 @app.get("/scan", response_class=HTMLResponse)
 def scan(request: Request, session: int = 1):
     session = 2 if session == 2 else 1
-    if not vol(request):
+    v = vol(request)
+    if not v:
         return RedirectResponse(f"/login?next=/scan?session={session}", 303)
     d = today_day()
-    html_content = SCAN_HTML.replace("__DAY__", str(d) if d else "none today").replace("__INIT_SESSION__", str(session))
+    html_content = (SCAN_HTML
+                    .replace("__DAY__", str(d) if d else "none today")
+                    .replace("__INIT_SESSION__", str(session))
+                    .replace("__VOL_NAME__", e(v)))
     return page(html_content, title="Scan")
 
 
