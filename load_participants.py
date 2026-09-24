@@ -8,7 +8,27 @@ import csv
 import os
 from supabase import create_client
 
-sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+def _load_env():
+    for fpath in (".env", ".env.example"):
+        if os.path.exists(fpath):
+            with open(fpath, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        k, v = line.split("=", 1)
+                        k, v = k.strip(), v.strip().strip("'\"")
+                        if k not in os.environ:
+                            os.environ[k] = v
+
+_load_env()
+
+supabase_url = os.environ.get("SUPABASE_URL", "").replace("/rest/v1/", "").replace("/rest/v1", "").rstrip("/")
+supabase_key = os.environ.get("SUPABASE_KEY", "")
+
+if not supabase_url or not supabase_key:
+    raise ValueError("SUPABASE_URL and SUPABASE_KEY must be set in the environment or .env file.")
+
+sb = create_client(supabase_url, supabase_key)
 
 rows = []
 with open("participants.csv", newline="", encoding="utf-8-sig") as f:
