@@ -77,6 +77,28 @@ def current_lecture() -> int:
         return 1
 
 
+def get_session_day(request: Request) -> int:
+    val = request.session.get("active_day")
+    if val is not None:
+        try:
+            return int(val)
+        except (ValueError, TypeError):
+            pass
+    td = today_day()
+    return td if td is not None else 1
+
+
+def get_session_lecture(request: Request) -> int:
+    val = request.session.get("active_lecture")
+    if val is not None:
+        try:
+            lec = int(val)
+            return lec if lec in (1, 2) else 1
+        except (ValueError, TypeError):
+            pass
+    return current_lecture()
+
+
 def display_name(p: dict) -> str:
     return p.get("name") or p["placeholder"]
 
@@ -91,9 +113,7 @@ def is_unique_violation(exc: Exception) -> bool:
 
 
 # ---------------------------------------------------------------- core logic (sync -- run via threadpool)
-def mark_sync(code: str, volunteer: str) -> dict:
-    day = today_day()
-    lecture = current_lecture()
+def mark_sync(code: str, volunteer: str, day: int, lecture: int) -> dict:
     ts = now_iso()
 
     res = sb.table("participants").select("*").eq("placeholder", code).execute()
@@ -203,6 +223,11 @@ button{background:#2563eb;color:#fff;font-weight:600}a{color:#93c5fd}
 .grey{background:#334155}table{width:100%;border-collapse:collapse;text-align:left;font-size:.95rem}
 td,th{padding:6px;border-bottom:1px solid #334155}.admin{align-items:stretch;justify-content:flex-start;text-align:left}
 .admin .card{max-width:900px;margin:auto}
+.selector-bar{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:12px 0 14px;text-align:left}
+.selector-group label{font-size:.82rem;font-weight:600;opacity:.8;display:block;margin-bottom:4px}
+.selector-group select{margin:0;padding:10px 12px;font-size:1rem;background:#1e293b;color:#f8fafc;border:1px solid #475569;border-radius:8px;cursor:pointer;width:100%}
+.selector-group select:focus{outline:2px solid #3b82f6}
+.badge-bar{font-size:.92rem;background:#1e293b;padding:8px 14px;border-radius:20px;display:inline-block;margin-bottom:12px;border:1px solid #334155}
 """
 
 
@@ -280,8 +305,25 @@ async def tap(code: str, request: Request):
         return RedirectResponse(f"/login?next=/t/{code}", 303)
     if not CODE_RE.match(code):
         return result_page({"status": "unknown"})
-    r = await run_in_threadpool(mark_sync, code, vol(request))
+    day = get_session_day(request)
+    lecture = get_session_lecture(request)
+    r = await run_in_threadpool(mark_sync, code, vol(request), day, lecture)
     return result_page(r)
+
+
+@app.post("/api/set-active")
+async def set_active(request: Request):
+    if not vol(request):
+        return JSONResponse({"status": "auth"}, status_code=401)
+    data = await request.json()
+    try:
+        day = int(data.get("day", 1))
+        lec = int(data.get("lecture", 1))
+        request.session["active_day"] = day
+        request.session["active_lecture"] = 1 if lec not in (1, 2) else lec
+        return {"ok": True, "day": request.session["active_day"], "lecture": request.session["active_lecture"]}
+    except Exception as ex:
+        return JSONResponse({"error": str(ex)}, status_code=400)
 
 
 @app.post("/api/mark")
@@ -292,32 +334,87 @@ async def api_mark(request: Request):
     code = str(data.get("code", "")).upper()
     if not CODE_RE.match(code):
         return {"status": "unknown"}
-    return await run_in_threadpool(mark_sync, code, vol(request))
+    req_day = data.get("day")
+    req_lec = data.get("lecture")
+    try:
+        day = int(req_day) if req_day is not None else get_session_day(request)
+    except (ValueError, TypeError):
+        day = get_session_day(request)
+    try:
+        lecture = int(req_lec) if req_lec is not None else get_session_lecture(request)
+        if lecture not in (1, 2):
+            lecture = 1
+    except (ValueError, TypeError):
+        lecture = get_session_lecture(request)
+    request.session["active_day"] = day
+    request.session["active_lecture"] = lecture
+    return await run_in_threadpool(mark_sync, code, vol(request), day, lecture)
 
 
 SCAN_HTML = """
-<h2>Camera scan</h2>
+<h2>Volunteer Scanner</h2>
+<div class="selector-bar">
+  <div class="selector-group">
+    <label for="daySelect">Event Date / Day</label>
+    <select id="daySelect" onchange="updateActiveSession()">
+      __DAY_OPTIONS__
+    </select>
+  </div>
+  <div class="selector-group">
+    <label for="lecSelect">Lecture</label>
+    <select id="lecSelect" onchange="updateActiveSession()">
+      __LEC_OPTIONS__
+    </select>
+  </div>
+</div>
+<div class="badge-bar" id="activeBadge">
+  Scanning for: <strong id="activeText">__ACTIVE_TEXT__</strong>
+</div>
 <video id="v" playsinline style="width:100%;border-radius:12px;background:#000"></video>
 <canvas id="c" style="display:none"></canvas>
 <div id="box" class="grey" style="border-radius:16px;padding:20px 12px;margin:12px 0">
   <p class="big" id="icon">📷</p><h1 id="who">Point at a QR code</h1><p id="sub"></p>
 </div>
-<p><a href="/logout">Log out</a> · Day: __DAY__ · Lecture: __LECTURE__</p>
+<p><a href="/logout">Log out</a> · Volunteer: __VOLUNTEER__</p>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jsqr/1.4.0/jsQR.js"></script>
 <script>
 const video=document.getElementById('v'),canvas=document.getElementById('c'),ctx=canvas.getContext('2d');
 const box=document.getElementById('box'),who=document.getElementById('who'),sub=document.getElementById('sub'),icon=document.getElementById('icon');
+const daySelect=document.getElementById('daySelect'),lecSelect=document.getElementById('lecSelect'),activeText=document.getElementById('activeText');
 let last='',lastAt=0;
 function show(cls,i,w,s){box.className=cls;icon.textContent=i;who.textContent=w;sub.textContent=s;
   if(navigator.vibrate)navigator.vibrate(cls==='ok'?80:[80,60,80]);}
+function updateBadge(){
+  const dText=daySelect.selectedOptions[0]?daySelect.selectedOptions[0].text:('Day '+daySelect.value);
+  const lText=lecSelect.selectedOptions[0]?lecSelect.selectedOptions[0].text:('Lecture '+lecSelect.value);
+  activeText.textContent=dText+' · '+lText;
+}
+async function updateActiveSession(){
+  updateBadge();
+  const day=parseInt(daySelect.value,10)||1;
+  const lecture=parseInt(lecSelect.value,10)||1;
+  try{
+    await fetch('/api/set-active',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({day,lecture})
+    });
+  }catch(e){console.error('Failed to sync session',e);}
+}
 async function handle(code){
   const t=Date.now(); if(code===last&&t-lastAt<3000)return; last=code;lastAt=t;
+  const day=parseInt(daySelect.value,10)||1;
+  const lecture=parseInt(lecSelect.value,10)||1;
   try{
-    const r=await fetch('/api/mark',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code})});
+    const r=await fetch('/api/mark',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({code,day,lecture})
+    });
     if(r.status===401){location='/login?next=/scan';return;}
     const d=await r.json();
-    if(d.status==='marked')show('ok','✓',d.name,d.roll_no+' · marked Day '+d.day+', Lec '+d.lecture);
-    else if(d.status==='duplicate')show('warn','!',d.name,'Already marked Day '+d.day+', Lec '+d.lecture+' at '+d.at.slice(11,19));
+    if(d.status==='marked')show('ok','✓',d.name,(d.roll_no?d.roll_no+' · ':'')+'marked Day '+d.day+', Lec '+d.lecture);
+    else if(d.status==='duplicate')show('warn','!',d.name,'Already marked Day '+d.day+', Lec '+d.lecture+' at '+(d.at?d.at.slice(11,19):''));
     else if(d.status==='no_event_day')show('grey','–','Not an event day','NOT marked');
     else show('bad','✗','Unknown code','Not registered');
   }catch(err){show('bad','✗','Network error','Try again');}
@@ -343,11 +440,35 @@ navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}}).then(s=>
 def scan(request: Request):
     if not vol(request):
         return RedirectResponse("/login?next=/scan", 303)
-    d = today_day()
-    lec = current_lecture()
-    html_str = (SCAN_HTML
-                .replace("__DAY__", str(d) if d else "none today")
-                .replace("__LECTURE__", str(lec)))
+    active_d = get_session_day(request)
+    active_lec = get_session_lecture(request)
+    n_days = len(EVENT_DATES) or 5
+    day_options = []
+    active_day_label = f"Day {active_d}"
+    for d in range(1, n_days + 1):
+        date_str = f" ({EVENT_DATES[d-1]})" if d - 1 < len(EVENT_DATES) else ""
+        selected = " selected" if d == active_d else ""
+        label = f"Day {d}{date_str}"
+        if d == active_d:
+            active_day_label = label
+        day_options.append(f"<option value='{d}'{selected}>{label}</option>")
+
+    lec_options = []
+    active_lec_label = f"Lecture {active_lec}"
+    for l in (1, 2):
+        selected = " selected" if l == active_lec else ""
+        label = f"Lecture {l}"
+        if l == active_lec:
+            active_lec_label = label
+        lec_options.append(f"<option value='{l}'{selected}>{label}</option>")
+
+    html_str = (
+        SCAN_HTML
+        .replace("__DAY_OPTIONS__", "".join(day_options))
+        .replace("__LEC_OPTIONS__", "".join(lec_options))
+        .replace("__ACTIVE_TEXT__", f"{active_day_label} · {active_lec_label}")
+        .replace("__VOLUNTEER__", e(vol(request)))
+    )
     return page(html_str, title="Scan")
 
 
