@@ -62,10 +62,12 @@ def now_iso() -> str:
 
 
 def today_day():
-    if DAY_OVERRIDE:
-        return int(DAY_OVERRIDE)
+    day_override = os.getenv("DAY_OVERRIDE", DAY_OVERRIDE)
+    if day_override:
+        return int(day_override)
+    event_dates = [d.strip() for d in os.getenv("EVENT_DATES", "").split(",") if d.strip()] or EVENT_DATES
     today = datetime.now(TZ).date().isoformat()
-    return EVENT_DATES.index(today) + 1 if today in EVENT_DATES else None
+    return event_dates.index(today) + 1 if today in event_dates else None
 
 
 def display_name(p: dict) -> str:
