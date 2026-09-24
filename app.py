@@ -488,10 +488,16 @@ const video=document.getElementById('v'),canvas=document.getElementById('c'),ctx
 const box=document.getElementById('box'),who=document.getElementById('who'),sub=document.getElementById('sub'),icon=document.getElementById('icon');
 const resultLinks=document.getElementById('resultLinks');
 const daySelect=document.getElementById('daySelect'),lecSelect=document.getElementById('lecSelect'),activeText=document.getElementById('activeText');
-let last='',lastAt=0,scanning=true,detector=null;
+let last='',lastAt=0,scanning=true,detector=null,isProcessing=false;
 
 if('BarcodeDetector' in window){
-  try{ detector=new BarcodeDetector({formats:['qr_code']}); }catch(e){ detector=null; }
+  try{
+    BarcodeDetector.getSupportedFormats().then(formats=>{
+      if(formats.includes('qr_code')){
+        detector=new BarcodeDetector({formats:['qr_code']});
+      }
+    }).catch(()=>{});
+  }catch(e){ detector=null; }
 }
 
 function playBeep(type){
@@ -541,15 +547,20 @@ async function updateActiveSession(){
 function extractCode(str){
   if(!str) return null;
   str=str.trim();
-  let m=str.match(/\/t\/([A-Za-z0-9]{4,10})/i);
-  if(m) return m[1].toUpperCase();
-  m=str.match(/\\b(P\\d{1,4})\\b/i);
+  // Match URL pattern like https://example.com/t/P001
+  let m=str.match(/\/t\/([A-Za-z0-9]{1,10})/i);
   if(m){
-    let num=m[1].slice(1);
-    return 'P'+num.padStart(3,'0').toUpperCase();
+    const raw=m[1].toUpperCase();
+    const pm=raw.match(/^P(\d+)$/);
+    if(pm) return 'P'+pm[1].padStart(3,'0');
+    return raw;
   }
-  m=str.match(/(P\\d{3})/i);
-  if(m) return m[1].toUpperCase();
+  // Match bare code like P1, P01, P001, P0001
+  m=str.match(/\bP(\d{1,4})\b/i);
+  if(m) return 'P'+m[1].padStart(3,'0').toUpperCase();
+  // Last resort: any P followed by 3 digits anywhere in string
+  m=str.match(/P(\d{3})/i);
+  if(m) return m[0].toUpperCase();
   return null;
 }
 
@@ -561,6 +572,7 @@ async function handle(rawCode){
   last=code; lastAt=t;
   const day=parseInt(daySelect.value,10)||1;
   const lecture=parseInt(lecSelect.value,10)||1;
+  show('grey','⏳','Processing...','Marking attendance for '+code,null);
   try{
     const r=await fetch('/api/mark',{
       method:'POST',
@@ -580,6 +592,7 @@ async function handle(rawCode){
     }
   }catch(err){
     show('bad','✗','Network error','Please try scanning again',null);
+    last=''; // allow immediate retry on network error
   }
 }
 
@@ -599,27 +612,36 @@ let lastScanTime=0;
 async function scanFrame(){
   if(!scanning) return;
   const now=Date.now();
-  if(now-lastScanTime>120 && video.readyState>=HTMLMediaElement.HAVE_CURRENT_DATA && video.videoWidth>0){
+  if(!isProcessing && now-lastScanTime>200 && video.readyState>=HTMLMediaElement.HAVE_CURRENT_DATA && video.videoWidth>0){
     lastScanTime=now;
-    if(detector){
-      try{
-        const barcodes=await detector.detect(video);
-        if(barcodes&&barcodes.length>0&&barcodes[0].rawValue){
-          handle(barcodes[0].rawValue);
+    isProcessing=true;
+    try{
+      if(detector){
+        try{
+          const barcodes=await detector.detect(video);
+          if(barcodes&&barcodes.length>0&&barcodes[0].rawValue){
+            handle(barcodes[0].rawValue);
+          }
+        }catch(e){
+          // BarcodeDetector failed on this frame; disable and use jsQR
+          detector=null;
         }
-      }catch(e){}
-    } else if(typeof jsQR!=='undefined'){
-      try{
-        const scale=Math.min(1, 640/Math.max(video.videoWidth, video.videoHeight));
-        canvas.width=Math.floor(video.videoWidth*scale);
-        canvas.height=Math.floor(video.videoHeight*scale);
-        ctx.drawImage(video,0,0,canvas.width,canvas.height);
-        const imgData=ctx.getImageData(0,0,canvas.width,canvas.height);
-        const qr=jsQR(imgData.data,canvas.width,canvas.height,{inversionAttempts:'dontInvert'});
-        if(qr&&qr.data){
-          handle(qr.data);
-        }
-      }catch(e){}
+      }
+      if(!detector && typeof jsQR!=='undefined'){
+        try{
+          const scale=Math.min(1, 640/Math.max(video.videoWidth, video.videoHeight));
+          canvas.width=Math.floor(video.videoWidth*scale);
+          canvas.height=Math.floor(video.videoHeight*scale);
+          ctx.drawImage(video,0,0,canvas.width,canvas.height);
+          const imgData=ctx.getImageData(0,0,canvas.width,canvas.height);
+          const qr=jsQR(imgData.data,canvas.width,canvas.height,{inversionAttempts:'attemptBoth'});
+          if(qr&&qr.data){
+            handle(qr.data);
+          }
+        }catch(e){}
+      }
+    }finally{
+      isProcessing=false;
     }
   }
   requestAnimationFrame(scanFrame);
@@ -638,12 +660,12 @@ navigator.mediaDevices.getUserMedia(constraints)
   .catch(()=>navigator.mediaDevices.getUserMedia({video:true}))
   .then(s=>{
     video.srcObject=s;
-    video.setAttribute('playsinline','true');
-    video.setAttribute('muted','true');
-    video.play().then(()=>{ requestAnimationFrame(scanFrame); }).catch(()=>{ requestAnimationFrame(scanFrame); });
+    video.play()
+      .then(()=>{ requestAnimationFrame(scanFrame); })
+      .catch(()=>{ requestAnimationFrame(scanFrame); });
   })
   .catch(err=>{
-    sub.textContent='Camera access denied or unavailable. Use manual input above or phone camera app.';
+    sub.textContent='Camera access denied or unavailable. Use the manual input above.';
     box.className='bad'; icon.textContent='⚠️'; who.textContent='Camera unavailable';
   });
 </script>
