@@ -28,25 +28,36 @@ from supabase import Client, create_client
 
 # ---------------------------------------------------------------- config
 def _load_env():
-    for fpath in (".env", ".env.example"):
-        if os.path.exists(fpath):
-            with open(fpath, encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if line and not line.startswith("#") and "=" in line:
-                        k, v = line.split("=", 1)
-                        k, v = k.strip(), v.strip().strip("'\"")
-                        if k not in os.environ:
-                            os.environ[k] = v
+    if os.path.exists(".env"):
+        with open(".env", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    os.environ[k.strip()] = v.strip().strip("'\"")
+    elif os.path.exists(".env.example"):
+        with open(".env.example", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    k, v = k.strip(), v.strip().strip("'\"")
+                    if k not in os.environ:
+                        os.environ[k] = v
 
 _load_env()
+
+DEFAULT_EVENT_DATES = "2026-09-24,2026-09-26,2026-09-27,2026-09-28,2026-09-29,2026-09-30,2026-10-01"
+raw_dates = os.getenv("EVENT_DATES", DEFAULT_EVENT_DATES)
+if not raw_dates or "2026-10-12" in raw_dates:
+    raw_dates = DEFAULT_EVENT_DATES
+EVENT_DATES = [d.strip() for d in raw_dates.split(",") if d.strip()]
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").replace("/rest/v1/", "").replace("/rest/v1", "").rstrip("/")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")  # service_role key -- server-side only, never expose to a browser
 SECRET_KEY = os.getenv("SECRET_KEY", "dev-only-change-me")
-VOLUNTEER_PIN = os.getenv("VOLUNTEER_PIN", "1234")
-ADMIN_PIN = os.getenv("ADMIN_PIN", "999999")
-EVENT_DATES = [d.strip() for d in os.getenv("EVENT_DATES", "").split(",") if d.strip()]
+VOLUNTEER_PIN = os.getenv("VOLUNTEER_PIN", "4821")
+ADMIN_PIN = os.getenv("ADMIN_PIN", "917304")
 DAY_OVERRIDE = os.getenv("DAY_OVERRIDE")  # testing only
 TZ = ZoneInfo(os.getenv("TZ_NAME", "Asia/Kolkata"))
 CODE_RE = re.compile(r"^P\d{3}$")
