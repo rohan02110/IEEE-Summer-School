@@ -76,7 +76,8 @@ def today_day():
     if DAY_OVERRIDE:
         return int(DAY_OVERRIDE)
     today = datetime.now(TZ).date().isoformat()
-    return EVENT_DATES.index(today) + 1 if today in EVENT_DATES else None
+    # Day number = index in EVENT_DATES (0-based: index 0 → Day 0, index 1 → Day 1, …)
+    return EVENT_DATES.index(today) if today in EVENT_DATES else None
 
 
 def current_lecture() -> int:
@@ -96,7 +97,7 @@ def get_session_day(request: Request) -> int:
         except (ValueError, TypeError):
             pass
     td = today_day()
-    return td if td is not None else 1
+    return td if td is not None else 0
 
 
 def get_session_lecture(request: Request) -> int:
@@ -111,8 +112,9 @@ def get_session_lecture(request: Request) -> int:
 
 
 def get_day_label(d: int) -> str:
-    if d - 1 < len(EVENT_DATES):
-        date_str = EVENT_DATES[d - 1]
+    # d is 0-based index into EVENT_DATES (Day 0 = test day, Day 1 = first real day, …)
+    if 0 <= d < len(EVENT_DATES):
+        date_str = EVENT_DATES[d]
         suffix = " - Test Day" if date_str == "2026-09-24" else ""
         return f"Day {d} ({date_str}{suffix})"
     return f"Day {d}"
@@ -513,14 +515,9 @@ function playBeep(type){
   }catch(e){}
 }
 
-function show(cls,i,w,s,code){
+function show(cls,i,w,s){
   box.className=cls; icon.textContent=i; who.textContent=w; sub.textContent=s;
-  if(code){
-    resultLinks.style.display='block';
-    resultLinks.innerHTML='<a href="/t/'+code+'" style="display:inline-block;padding:8px 14px;background:rgba(255,255,255,0.2);border-radius:8px;color:#fff;text-decoration:none;font-size:0.9rem;font-weight:bold;margin-top:6px">View Confirmation Page →</a>';
-  } else {
-    resultLinks.style.display='none';
-  }
+  resultLinks.style.display='none';
   playBeep(cls);
   if(navigator.vibrate) navigator.vibrate(cls==='ok'?80:[80,60,80]);
 }
@@ -582,16 +579,16 @@ async function handle(rawCode){
     if(r.status===401){location='/login?next=/scan';return;}
     const d=await r.json();
     if(d.status==='marked'){
-      show('ok','✓',d.name,(d.roll_no?d.roll_no+' · ':'')+'Marked Day '+d.day+', Lec '+d.lecture,code);
+      show('ok','✓',d.name,(d.roll_no?d.roll_no+' · ':'')+'Marked Day '+d.day+', Lec '+d.lecture);
     } else if(d.status==='duplicate'){
-      show('warn','!',d.name,'Already marked Day '+d.day+', Lec '+d.lecture+' at '+(d.at?d.at.slice(11,19):''),code);
+      show('warn','!',d.name,'Already marked Day '+d.day+', Lec '+d.lecture+' at '+(d.at?d.at.slice(11,19):''));
     } else if(d.status==='no_event_day'){
-      show('grey','–','Not an event day','NOT marked',code);
+      show('grey','–','Not an event day','NOT marked');
     } else {
-      show('bad','✗','Unknown code ('+code+')','Not registered in participant list',null);
+      show('bad','✗','Unknown code ('+code+')','Not registered in participant list');
     }
   }catch(err){
-    show('bad','✗','Network error','Please try scanning again',null);
+    show('bad','✗','Network error','Please try scanning again');
     last=''; // allow immediate retry on network error
   }
 }
@@ -681,7 +678,7 @@ def scan(request: Request):
     n_days = len(EVENT_DATES) or 5
     day_options = []
     active_day_label = get_day_label(active_d)
-    for d in range(1, n_days + 1):
+    for d in range(0, n_days):  # Day 0 … Day (n-1)
         selected = " selected" if d == active_d else ""
         label = get_day_label(d)
         day_options.append(f"<option value='{d}'{selected}>{label}</option>")
@@ -723,7 +720,7 @@ async def admin(request: Request, msg: str = ""):
         f"<td>{e(r['marked_at'][11:19])}</td><td>{e(r['marked_by'])}</td></tr>"
         for r in recent
     )
-    opts_day = "".join(f"<option value='{d}'>{get_day_label(d)}</option>" for d in range(1, n_days + 1))
+    opts_day = "".join(f"<option value='{d}'>{get_day_label(d)}</option>" for d in range(0, n_days))
     opts_lec = "<option value='1'>Lecture 1</option><option value='2'>Lecture 2</option>"
     note = f"<p style='color:#86efac'>{e(msg)}</p>" if msg else ""
     body = (
