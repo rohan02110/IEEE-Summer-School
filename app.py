@@ -99,6 +99,14 @@ def get_session_lecture(request: Request) -> int:
     return current_lecture()
 
 
+def get_day_label(d: int) -> str:
+    if d - 1 < len(EVENT_DATES):
+        date_str = EVENT_DATES[d - 1]
+        suffix = " - Test Day" if date_str == "2026-09-24" else ""
+        return f"Day {d} ({date_str}{suffix})"
+    return f"Day {d}"
+
+
 def display_name(p: dict) -> str:
     return p.get("name") or p["placeholder"]
 
@@ -444,13 +452,10 @@ def scan(request: Request):
     active_lec = get_session_lecture(request)
     n_days = len(EVENT_DATES) or 5
     day_options = []
-    active_day_label = f"Day {active_d}"
+    active_day_label = get_day_label(active_d)
     for d in range(1, n_days + 1):
-        date_str = f" ({EVENT_DATES[d-1]})" if d - 1 < len(EVENT_DATES) else ""
         selected = " selected" if d == active_d else ""
-        label = f"Day {d}{date_str}"
-        if d == active_d:
-            active_day_label = label
+        label = get_day_label(d)
         day_options.append(f"<option value='{d}'{selected}>{label}</option>")
 
     lec_options = []
@@ -480,7 +485,7 @@ async def admin(request: Request, msg: str = ""):
     n_days = len(EVENT_DATES) or 5
     total, per_day_lec, unknown, recent = await run_in_threadpool(stats_sync)
     stats = "".join(
-        f"<tr><td>Day {d}</td><td>L1: {per_day_lec.get((d, 1), 0)} / {total}</td><td>L2: {per_day_lec.get((d, 2), 0)} / {total}</td></tr>"
+        f"<tr><td>{get_day_label(d)}</td><td>L1: {per_day_lec.get((d, 1), 0)} / {total}</td><td>L2: {per_day_lec.get((d, 2), 0)} / {total}</td></tr>"
         for d in range(1, n_days + 1)
     )
     rows = "".join(
@@ -490,12 +495,12 @@ async def admin(request: Request, msg: str = ""):
         f"<td>{e(r['marked_at'][11:19])}</td><td>{e(r['marked_by'])}</td></tr>"
         for r in recent
     )
-    opts_day = "".join(f"<option value='{d}'>Day {d}</option>" for d in range(1, n_days + 1))
+    opts_day = "".join(f"<option value='{d}'>{get_day_label(d)}</option>" for d in range(1, n_days + 1))
     opts_lec = "<option value='1'>Lecture 1</option><option value='2'>Lecture 2</option>"
     note = f"<p style='color:#86efac'>{e(msg)}</p>" if msg else ""
     body = (
         f"<h2>Admin</h2>{note}"
-        f"<p>Today = Day {today_day() or '—'} · Active = Lecture {current_lecture()} · registered: {total} · unknown scans: {unknown}</p>"
+        f"<p>Today = {get_day_label(today_day()) if today_day() else '—'} · Active = Lecture {current_lecture()} · registered: {total} · unknown scans: {unknown}</p>"
         f"<table><tr><th>Day</th><th>Lecture 1</th><th>Lecture 2</th></tr>{stats}</table>"
         f"<p><a href='/export.csv'>Download attendance CSV</a> · <a href='/scan'>Scan</a> · <a href='/logout'>Log out</a></p>"
         f"<h3>Manual mark / undo</h3>"
