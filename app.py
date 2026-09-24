@@ -82,9 +82,10 @@ def is_unique_violation(exc: Exception) -> bool:
 
 
 # ---------------------------------------------------------------- core logic (sync -- run via threadpool)
-def mark_sync(code: str, volunteer: str) -> dict:
+def mark_sync(code: str, volunteer: str, session: int = 1) -> dict:
     day = today_day()
     ts = now_iso()
+    session = 2 if session == 2 else 1
 
     res = sb.table("participants").select("*").eq("placeholder", code).execute()
     if not res.data:
@@ -92,21 +93,21 @@ def mark_sync(code: str, volunteer: str) -> dict:
         return {"status": "unknown"}
 
     p = res.data[0]
-    base = {"name": display_name(p), "roll_no": p.get("roll_no") or "", "day": day}
+    base = {"name": display_name(p), "roll_no": p.get("roll_no") or "", "day": day, "session": session}
     if day is None:
         return {"status": "no_event_day", **base}
 
     try:
         sb.table("attendance").insert(
-            {"placeholder": code, "day": day, "marked_at": ts, "marked_by": volunteer}
+            {"placeholder": code, "day": day, "session": session, "marked_at": ts, "marked_by": volunteer}
         ).execute()
         status, at = "marked", ts
     except Exception as ex:
         if not is_unique_violation(ex):
             raise
         existing = (sb.table("attendance").select("marked_at")
-                    .eq("placeholder", code).eq("day", day).execute())
-        status, at = "duplicate", existing.data[0]["marked_at"]
+                    .eq("placeholder", code).eq("day", day).eq("session", session).execute())
+        status, at = "duplicate", (existing.data[0]["marked_at"] if existing.data else ts)
 
     sb.table("scan_log").insert({"ts": ts, "code": code, "result": status, "volunteer": volunteer}).execute()
     return {"status": status, "at": at, **base}
@@ -114,46 +115,47 @@ def mark_sync(code: str, volunteer: str) -> dict:
 
 def stats_sync():
     total = len(sb.table("participants").select("placeholder").execute().data)
-    att = sb.table("attendance").select("day").execute().data
-    per_day = Counter(r["day"] for r in att)
+    att = sb.table("attendance").select("day,session").execute().data
+    per_day_session = Counter((r["day"], r.get("session", 1)) for r in att)
     unknown = len(sb.table("scan_log").select("id").eq("result", "unknown").execute().data)
     # Embedded select pulls the participant's name/roll_no in the same query via the FK.
     recent = (sb.table("attendance")
-              .select("day,marked_at,marked_by,placeholder,participants(name,roll_no)")
+              .select("day,session,marked_at,marked_by,placeholder,participants(name,roll_no)")
               .order("marked_at", desc=True).limit(40).execute().data)
-    return total, per_day, unknown, recent
+    return total, per_day_session, unknown, recent
 
 
 def export_rows_sync(n_days: int):
     participants = sb.table("participants").select("*").order("placeholder").execute().data
-    att = sb.table("attendance").select("placeholder,day,marked_at").execute().data
+    att = sb.table("attendance").select("placeholder,day,session,marked_at").execute().data
     marks = defaultdict(dict)
     for r in att:
-        marks[r["placeholder"]][r["day"]] = r["marked_at"]
+        marks[r["placeholder"]][(r["day"], r.get("session", 1))] = r["marked_at"]
     rows = []
     for p in participants:
         m = marks[p["placeholder"]]
         rows.append([p["placeholder"], p.get("roll_no") or "", p.get("name") or ""] +
-                    [m.get(d, "") for d in range(1, n_days + 1)] + [len(m)])
+                    [m.get((d, s), "") for d in range(1, n_days + 1) for s in (1, 2)] + [len(m)])
     return rows
 
 
-def manual_mark_sync(code: str, day: int, action: str, volunteer: str):
+def manual_mark_sync(code: str, day: int, session: int, action: str, volunteer: str):
+    session = 2 if session == 2 else 1
     res = sb.table("participants").select("placeholder,name").eq("placeholder", code).execute()
     if not res.data:
         return None
     p = res.data[0]
     if action == "unmark":
-        sb.table("attendance").delete().eq("placeholder", code).eq("day", day).execute()
-        return f"Removed Day {day} mark for {display_name(p)}"
+        sb.table("attendance").delete().eq("placeholder", code).eq("day", day).eq("session", session).execute()
+        return f"Removed Day {day} - Lecture {session} mark for {display_name(p)}"
     try:
         sb.table("attendance").insert(
-            {"placeholder": code, "day": day, "marked_at": now_iso(), "marked_by": volunteer}
+            {"placeholder": code, "day": day, "session": session, "marked_at": now_iso(), "marked_by": volunteer}
         ).execute()
     except Exception as ex:
         if not is_unique_violation(ex):
             raise  # already marked -- fine, treat as a no-op
-    return f"Marked {display_name(p)} present for Day {day}"
+    return f"Marked {display_name(p)} present for Day {day} - Lecture {session}"
 
 
 # ---------------------------------------------------------------- auth
@@ -208,15 +210,19 @@ def e(x) -> str:
 
 def result_page(r: dict) -> HTMLResponse:
     s = r["status"]
+    day = r.get("day")
+    session = r.get("session", 1)
     if s == "marked":
         return page(f"<p class='big'>✓</p><h1>{e(r['name'])}</h1><p>{e(r['roll_no'])}</p>"
-                    f"<h2>Marked present — Day {r['day']}</h2><p>{e(r['at'][11:19])}</p>"
-                    f"<p><a href='/scan'>Scan mode</a></p>", "ok")
+                    f"<h2>Marked present — Day {day}, Lecture {session}</h2><p>{e(r['at'][11:19])}</p>"
+                    f"<p><a href='/scan?session={session}'>Scan mode</a></p>", "ok")
     if s == "duplicate":
         return page(f"<p class='big'>!</p><h1>{e(r['name'])}</h1><p>{e(r['roll_no'])}</p>"
-                    f"<h2>Already marked today</h2><p>at {e(r['at'][11:19])}</p>", "warn")
+                    f"<h2>Already marked — Day {day}, Lecture {session}</h2><p>at {e(r['at'][11:19])}</p>"
+                    f"<p><a href='/scan?session={session}'>Scan mode</a></p>", "warn")
     if s == "no_event_day":
-        return page(f"<p class='big'>–</p><h1>Not an event day</h1><p>{e(r['name'])} was NOT marked.</p>", "grey")
+        return page(f"<p class='big'>–</p><h1>Not an event day</h1><p>{e(r['name'])} was NOT marked.</p>"
+                    f"<p><a href='/scan?session={session}'>Scan mode</a></p>", "grey")
     return page("<p class='big'>✗</p><h1>Unknown code</h1><p>This QR code is not registered.</p>", "bad")
 
 
@@ -259,13 +265,14 @@ def logout(request: Request):
 
 # ---------------------------------------------------------------- routes: scanning
 @app.get("/t/{code}")
-async def tap(code: str, request: Request):
+async def tap(code: str, request: Request, session: int = 1):
     code = code.upper()
+    session = 2 if session == 2 else 1
     if not vol(request):
-        return RedirectResponse(f"/login?next=/t/{code}", 303)
+        return RedirectResponse(f"/login?next=/t/{code}?session={session}", 303)
     if not CODE_RE.match(code):
         return result_page({"status": "unknown"})
-    r = await run_in_threadpool(mark_sync, code, vol(request))
+    r = await run_in_threadpool(mark_sync, code, vol(request), session)
     return result_page(r)
 
 
@@ -273,36 +280,81 @@ async def tap(code: str, request: Request):
 async def api_mark(request: Request):
     if not vol(request):
         return JSONResponse({"status": "auth"}, status_code=401)
-    data = await request.json()
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"status": "invalid_json"}, status_code=400)
     code = str(data.get("code", "")).upper()
+    session_val = data.get("session", 1)
+    try:
+        session = int(session_val)
+        if session not in (1, 2):
+            return JSONResponse({"status": "invalid_session", "error": "session must be 1 or 2"}, status_code=400)
+    except (ValueError, TypeError):
+        return JSONResponse({"status": "invalid_session", "error": "session must be 1 or 2"}, status_code=400)
+
     if not CODE_RE.match(code):
         return {"status": "unknown"}
-    return await run_in_threadpool(mark_sync, code, vol(request))
+    return await run_in_threadpool(mark_sync, code, vol(request), session)
 
 
 SCAN_HTML = """
+<div style="display:flex;gap:8px;margin-bottom:12px">
+  <button type="button" id="btn-l1" onclick="setSession(1)" style="flex:1;background:#2563eb;color:#fff;font-weight:600;padding:12px;border-radius:10px;border:0;cursor:pointer">Lecture 1</button>
+  <button type="button" id="btn-l2" onclick="setSession(2)" style="flex:1;background:#334155;color:#fff;font-weight:600;padding:12px;border-radius:10px;border:0;cursor:pointer">Lecture 2</button>
+</div>
 <h2>Camera scan</h2>
 <video id="v" playsinline style="width:100%;border-radius:12px;background:#000"></video>
 <canvas id="c" style="display:none"></canvas>
 <div id="box" class="grey" style="border-radius:16px;padding:20px 12px;margin:12px 0">
-  <p class="big" id="icon">📷</p><h1 id="who">Point at a QR code</h1><p id="sub"></p>
+  <p class="big" id="icon">📷</p><h1 id="who">Point at a QR code</h1><p id="sub">Active: Lecture <span id="cur-lec">1</span></p>
 </div>
-<p><a href="/logout">Log out</a> · Day: __DAY__</p>
+<p><a href="/logout">Log out</a> · Day: __DAY__ · Lecture: <span id="lbl-lec">1</span></p>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jsqr/1.4.0/jsQR.js"></script>
 <script>
 const video=document.getElementById('v'),canvas=document.getElementById('c'),ctx=canvas.getContext('2d');
 const box=document.getElementById('box'),who=document.getElementById('who'),sub=document.getElementById('sub'),icon=document.getElementById('icon');
+const btnL1=document.getElementById('btn-l1'),btnL2=document.getElementById('btn-l2');
+const curLec=document.getElementById('cur-lec'),lblLec=document.getElementById('lbl-lec');
+
+let currentSession = parseInt(new URLSearchParams(location.search).get('session') || '__INIT_SESSION__');
+if (currentSession !== 1 && currentSession !== 2) currentSession = 1;
+
+function updateSessionUI(){
+  if(currentSession === 1){
+    btnL1.style.background='#2563eb';
+    btnL2.style.background='#334155';
+  } else {
+    btnL1.style.background='#334155';
+    btnL2.style.background='#2563eb';
+  }
+  if(curLec) curLec.textContent = currentSession;
+  if(lblLec) lblLec.textContent = currentSession;
+}
+function setSession(s){
+  currentSession = (s === 2) ? 2 : 1;
+  updateSessionUI();
+  const url = new URL(window.location);
+  url.searchParams.set('session', currentSession);
+  window.history.replaceState({}, '', url);
+}
+updateSessionUI();
+
 let last='',lastAt=0;
 function show(cls,i,w,s){box.className=cls;icon.textContent=i;who.textContent=w;sub.textContent=s;
   if(navigator.vibrate)navigator.vibrate(cls==='ok'?80:[80,60,80]);}
 async function handle(code){
   const t=Date.now(); if(code===last&&t-lastAt<3000)return; last=code;lastAt=t;
   try{
-    const r=await fetch('/api/mark',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code})});
-    if(r.status===401){location='/login?next=/scan';return;}
+    const r=await fetch('/api/mark',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({code, session: currentSession})
+    });
+    if(r.status===401){location='/login?next=' + encodeURIComponent('/scan?session=' + currentSession);return;}
     const d=await r.json();
-    if(d.status==='marked')show('ok','✓',d.name,d.roll_no+' · marked Day '+d.day);
-    else if(d.status==='duplicate')show('warn','!',d.name,'Already marked at '+d.at.slice(11,19));
+    if(d.status==='marked')show('ok','✓',d.name,d.roll_no+' · marked Day '+d.day+' (Lecture '+d.session+')');
+    else if(d.status==='duplicate')show('warn','!',d.name,'Already marked Day '+d.day+' (Lecture '+d.session+') at '+d.at.slice(11,19));
     else if(d.status==='no_event_day')show('grey','–','Not an event day','NOT marked');
     else show('bad','✗','Unknown code','Not registered');
   }catch(err){show('bad','✗','Network error','Try again');}
@@ -325,11 +377,13 @@ navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}}).then(s=>
 
 
 @app.get("/scan", response_class=HTMLResponse)
-def scan(request: Request):
+def scan(request: Request, session: int = 1):
+    session = 2 if session == 2 else 1
     if not vol(request):
-        return RedirectResponse("/login?next=/scan", 303)
+        return RedirectResponse(f"/login?next=/scan?session={session}", 303)
     d = today_day()
-    return page(SCAN_HTML.replace("__DAY__", str(d) if d else "none today"), title="Scan")
+    html_content = SCAN_HTML.replace("__DAY__", str(d) if d else "none today").replace("__INIT_SESSION__", str(session))
+    return page(html_content, title="Scan")
 
 
 # ---------------------------------------------------------------- routes: admin
@@ -338,12 +392,16 @@ async def admin(request: Request, msg: str = ""):
     if not is_admin(request):
         return RedirectResponse("/login?next=/admin", 303)
     n_days = len(EVENT_DATES) or 5
-    total, per_day, unknown, recent = await run_in_threadpool(stats_sync)
-    stats = "".join(f"<tr><td>Day {d}</td><td>{per_day.get(d, 0)} / {total}</td></tr>" for d in range(1, n_days + 1))
+    total, per_day_session, unknown, recent = await run_in_threadpool(stats_sync)
+    stats = "".join(
+        f"<tr><td>Day {d} - Lecture 1</td><td>{per_day_session.get((d, 1), 0)} / {total}</td></tr>"
+        f"<tr><td>Day {d} - Lecture 2</td><td>{per_day_session.get((d, 2), 0)} / {total}</td></tr>"
+        for d in range(1, n_days + 1)
+    )
     rows = "".join(
         f"<tr><td>{e((r.get('participants') or {}).get('name') or r['placeholder'])}</td>"
         f"<td>{e((r.get('participants') or {}).get('roll_no') or '')}</td>"
-        f"<td>{e(r['placeholder'])}</td><td>D{r['day']}</td>"
+        f"<td>{e(r['placeholder'])}</td><td>D{r['day']}</td><td>L{r.get('session', 1)}</td>"
         f"<td>{e(r['marked_at'][11:19])}</td><td>{e(r['marked_by'])}</td></tr>" for r in recent)
     opts = "".join(f"<option value='{d}'>Day {d}</option>" for d in range(1, n_days + 1))
     note = f"<p style='color:#86efac'>{e(msg)}</p>" if msg else ""
@@ -351,18 +409,21 @@ async def admin(request: Request, msg: str = ""):
             f"<table>{stats}</table><p><a href='/export.csv'>Download attendance CSV</a> · <a href='/scan'>Scan</a> · "
             f"<a href='/logout'>Log out</a></p><h3>Manual mark / undo</h3>"
             f"<form method='post' action='/admin/manual'><input name='placeholder' placeholder='Placeholder e.g. P014' required>"
-            f"<select name='day'>{opts}</select><select name='action'><option value='mark'>Mark present</option>"
+            f"<select name='day'>{opts}</select>"
+            f"<select name='session'><option value='1'>Lecture 1</option><option value='2'>Lecture 2</option></select>"
+            f"<select name='action'><option value='mark'>Mark present</option>"
             f"<option value='unmark'>Remove mark</option></select><button>Apply</button></form>"
-            f"<h3>Latest 40 marks</h3><table><tr><th>Name</th><th>Roll</th><th>Code</th><th>Day</th><th>Time</th><th>By</th></tr>{rows}</table>")
+            f"<h3>Latest 40 marks</h3><table><tr><th>Name</th><th>Roll</th><th>Code</th><th>Day</th><th>Lecture</th><th>Time</th><th>By</th></tr>{rows}</table>")
     return page(body, "admin")
 
 
 @app.post("/admin/manual")
-async def admin_manual(request: Request, placeholder: str = Form(...), day: int = Form(...), action: str = Form(...)):
+async def admin_manual(request: Request, placeholder: str = Form(...), day: int = Form(...), session: int = Form(1), action: str = Form(...)):
     if not is_admin(request):
         return RedirectResponse("/login?next=/admin", 303)
     code = placeholder.strip().upper()
-    msg = await run_in_threadpool(manual_mark_sync, code, day, action, vol(request))
+    session = 2 if session == 2 else 1
+    msg = await run_in_threadpool(manual_mark_sync, code, day, session, action, vol(request))
     if msg is None:
         return RedirectResponse("/admin?msg=Placeholder+not+found", 303)
     return RedirectResponse("/admin?msg=" + msg.replace(" ", "+"), 303)
@@ -376,7 +437,11 @@ async def export_csv(request: Request):
     rows = await run_in_threadpool(export_rows_sync, n_days)
     out = io.StringIO()
     w = csv.writer(out)
-    w.writerow(["placeholder", "roll_no", "name"] + [f"day{d}" for d in range(1, n_days + 1)] + ["days_attended"])
+    header = ["placeholder", "roll_no", "name"]
+    for d in range(1, n_days + 1):
+        header.extend([f"day{d}_L1", f"day{d}_L2"])
+    header.append("sessions_attended")
+    w.writerow(header)
     w.writerows(rows)
     return Response(out.getvalue(), media_type="text/csv",
                     headers={"Content-Disposition": "attachment; filename=attendance.csv"})

@@ -9,9 +9,10 @@ create table if not exists participants (
 create table if not exists attendance (
   placeholder text not null references participants(placeholder),
   day         integer not null,
+  session     integer not null default 1 check (session in (1, 2)),
   marked_at   timestamptz not null default now(),
   marked_by   text not null,
-  primary key (placeholder, day)         -- one row per participant per day
+  primary key (placeholder, day, session) -- one row per participant per day per lecture session
 );
 
 create table if not exists scan_log (
@@ -28,3 +29,11 @@ create table if not exists scan_log (
 alter table participants enable row level security;
 alter table attendance   enable row level security;
 alter table scan_log     enable row level security;
+
+-- -----------------------------------------------------------------------------
+-- MIGRATION SCRIPT (if attendance table already exists with (placeholder, day) PK):
+-- -----------------------------------------------------------------------------
+-- alter table attendance add column if not exists session integer not null default 1 check (session in (1, 2));
+-- alter table attendance drop constraint if exists attendance_pkey;
+-- alter table attendance add primary key (placeholder, day, session);
+
